@@ -83,7 +83,7 @@ jiaoben/
    - `PKG_DIR=/date` —— 追加为最高优先级搜索目录
    - `SRC_DIR` / `DOWNLOAD_DIR` —— 源码与下载目录（默认 `/data`）
 4. **幂等**：重复执行一般会跳过已完成的步骤或只做补装；破坏性操作（覆盖配置、替换二进制）会先备份。
-5. **systemd 服务名**：`docker`、`mysql`、`php-fpm`、`rabbitmq-server`、`zookeeper`；Tomcat/ELK 组件用 `startup.sh` / supervisor 管理。
+5. **systemd 服务名**：docker、mysql、php-fpm、rabbitmq-server、zookeeper；Tomcat/ELK 组件用 startup.sh / supervisor 管理。
 
 ---
 
