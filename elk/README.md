@@ -71,5 +71,4 @@ Kibana 需要在界面里手动创建索引模式 `logstashaa-*` 才能看到数
 ## 注意
 
 - 这是**单机**版本（单 ES 节点、无副本），仅适合学习/测试；生产要做多节点集群并开启安全认证。
-- `elk-standalone.sh.bak` 是该脚本的旧版本备份，不要执行，仅用于对比历史实现。
 - 进程由 supervisor 管理，`systemctl` 里没有独立的 es/kibana 服务；排查优先跑 `./elk-standalone.sh diagnose`。

@@ -92,5 +92,3 @@ systemctl status zookeeper
 echo ruok | nc 127.0.0.1 2181                      # 预期 imok
 /usr/local/zookeeper/bin/zkCli.sh -server 127.0.0.1:2181
 ```
-
-> `zookeeper-install.sh.bak` 是旧版本备份，仅作对比，不要执行。
