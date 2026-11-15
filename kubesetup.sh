@@ -19,6 +19,7 @@
 #    token         单独生成 join 命令（配合 --token-ttl 0 造永不过期 token）
 #    completion    只安装 kubectl / kubeadm 命令补全
 #    cni           下发 flannel（kube-flannel-all.yml）并等待节点 Ready
+#    ingress       下发 ingress-nginx（kube-ingress.yaml，NodePort）并等待就绪
 #    scale         交互输入 worker 数量与 IP，通过 ansible 批量准备 + join
 #    drain         缩容：驱逐 Pod、停止调度、摘除节点（--drain-node 指定单台）
 #    certs         查看控制面证书有效期（kubeadm certs check-expiration）
@@ -51,6 +52,7 @@
 #    --no-sync-hosts               不同步 /etc/ansible/hosts
 #    --ansible-python PATH         远端 python 路径；留空由 ansible 自动发现
 #    --manifest PATH               flannel 清单输出路径（缺省 $HOME/kube-flannel-all.yml）
+#    --ingress-manifest PATH       ingress 清单输出路径（缺省 $HOME/kube-ingress.yaml）
 #    --keep-backups                保留 /var/backups/kubesetup/<ts>/（默认成功后自动删除）
 #    --log-keep N                  只保留最近 N 份日志（缺省 2）
 #    --cmd-name kubesetup          生成的系统命令名
@@ -120,6 +122,7 @@ NTP_SERVER="${NTP_SERVER:-ntp1.aliyun.com}"
 DOCKER_REPO_URL="${DOCKER_REPO_URL:-http://mirrors.aliyun.com/docker-ce/linux/centos/docker-ce.repo}"
 
 FLANNEL_MANIFEST="${FLANNEL_MANIFEST:-$HOME/kube-flannel-all.yml}"
+INGRESS_MANIFEST="${INGRESS_MANIFEST:-$HOME/kube-ingress.yaml}"   # ingress-nginx 清单落盘位置
 JOIN_FILE="${JOIN_FILE:-$HOME/kubeadm-join-command.txt}"
 WORKER_INVENTORY="${WORKER_INVENTORY:-/root/k8s-workers.ini}"
 REMOTE_SCRIPT="${REMOTE_SCRIPT:-/usr/bin/kubesetup}"   # 分发后 worker 上直接用的命令路径
@@ -167,16 +170,21 @@ COMPLETION_PROFILE="${COMPLETION_PROFILE:-/etc/profile.d/k8s-completion.sh}"
 
 # 子命令唯一清单：参数解析白名单、命令补全都由此生成，避免多处漂移。
 # 改子命令只需改这一行 + 对应的 case 分支。
-SUBCOMMANDS=(bootstrap preflight prepare init token completion cni scale drain ports certs renew backup status reset install uninstall)
+SUBCOMMANDS=(bootstrap preflight prepare init token completion cni ingress scale drain ports certs renew backup status reset install uninstall)
 # 通用选项：供 kubesetup <TAB> 补全
 CMD_OPTIONS=(--k8s-version --service-cidr --pod-cidr --apiserver-ip --image-repository
              --cri-socket --node-name --ssh-user --inventory --manifest --log-file
              --token-ttl --ttl-forever --no-completion --no-install-cmd
              --force --insecure-ports --restart-network --yes --dry-run --verbose --help -h
-             --drain-node --backup-dir --backup-keep --on --off --keep-backups --log-keep)
+             --drain-node --backup-dir --backup-keep --on --off --keep-backups --log-keep
+             --no-crictl-download --crictl-version)
 WAIT_TIMEOUT="${WAIT_TIMEOUT:-600}"
 # 运行结束后不留多余文件：备份集中放一个目录、成功即删；旧日志只保留最近 N 份
 LOG_KEEP="${LOG_KEEP:-2}"
+# crictl 兼容性：kubelet 1.20 的 dockershim 只说 CRI v1alpha2，crictl ≥1.25 只说 v1。
+# 检测到不兼容时自动装这个版本到 /usr/local/bin（--no-crictl-download 可关）。
+CRICTL_VERSION_COMPAT="${CRICTL_VERSION_COMPAT:-v1.22.0}"
+CRICTL_DOWNLOAD="${CRICTL_DOWNLOAD:-1}"
 PORTS_MODE="${PORTS_MODE:-status}"   # ports 子命令：status|on|off
 # 新增功能相关
 DRAIN_NODE="${DRAIN_NODE:-}"                         # drain 单节点：--drain-node worker2
@@ -643,7 +651,106 @@ node_prepare() {
   docker_install
   kubeadm_install
   install_shell_completion   # kubectl/kubeadm 已就位，master 与 worker 都装系统级补全
+  setup_crictl               # 写 /etc/crictl.yaml，并检查 crictl 版本是否与 dockershim 兼容
   ok "节点准备完成： $(hostname)"
+}
+
+# ----------------------------- 3.9 crictl 配置 -------------------------------
+# crictl 不带 --runtime-endpoint 时会依次尝试 dockershim / containerd / crio 四个
+# socket，全失败就吐一屏 WARN 和 "CRI v1 runtime API is not implemented"，
+# 极易被误判成"集群坏了"。这里显式写死唯一 endpoint。
+detect_cri_endpoint() {
+  if [[ -n "$CRI_SOCKET" ]]; then printf '%s\n' "$CRI_SOCKET"; return 0; fi
+  if systemctl is-active --quiet docker 2>/dev/null; then
+    printf 'unix:///var/run/dockershim.sock\n'; return 0
+  fi
+  if systemctl is-active --quiet containerd 2>/dev/null; then
+    printf 'unix:///run/containerd/containerd.sock\n'; return 0
+  fi
+  printf 'unix:///var/run/dockershim.sock\n'
+}
+
+setup_crictl() {
+  local f=/etc/crictl.yaml ep
+  ep="$(detect_cri_endpoint)"
+  if [[ "$DRY_RUN" == 1 ]]; then
+    dry "写 $f（runtime-endpoint: $ep）"
+  else
+    [[ -f "$f" ]] && backup_path "$f"
+    write_file "$f" 0644 <<YML
+runtime-endpoint: ${ep}
+image-endpoint: ${ep}
+timeout: 10
+debug: false
+YML
+    ok "crictl 配置： $f -> $ep"
+  fi
+
+  # 版本兼容性：kubelet 1.20 的 dockershim 只实现 CRI v1alpha2，
+  # 而 crictl v1.25+ 只讲 v1，于是报 "CRI v1 runtime API is not implemented"。
+  # 注意 crictl 版本形如 v1.25.0，其中 25 是**次版本**，要按第二段判断。
+  [[ "$ep" == *dockershim* ]] || return 0
+  command -v crictl >/dev/null 2>&1 || return 0
+  local ver minor
+  ver="$(crictl --version 2>/dev/null | awk '{print $NF}')"
+  ver="${ver#v}"
+  minor="$(printf '%s' "$ver" | cut -d. -f2)"
+  if [[ "$minor" =~ ^[0-9]+$ ]] && (( minor >= 25 )); then
+    warn "crictl ${ver:-未知版本} 与 kubelet 1.20 的 dockershim 不兼容（它只说 CRI v1，dockershim 只支持 v1alpha2）"
+    warn "  现象： crictl ps / crictl info 报 'CRI v1 runtime API is not implemented'"
+    install_compatible_crictl "$minor"
+  else
+    debug "crictl ${ver:-未安装} 与 dockershim 兼容"
+  fi
+}
+
+# 下载并安装与本集群兼容的 crictl（默认 v1.22.0，它对 dockershim 仍讲 v1alpha2）。
+# 装到 /usr/local/bin/crictl，在 CentOS 7 上 /usr/local/bin 先于 /usr/bin 出现在 PATH，
+# 因此会覆盖系统里那个过新的版本；原文件不动，随时可回退。
+install_compatible_crictl() {
+  local cur_minor=$1 want="${CRICTL_VERSION_COMPAT:-v1.22.0}"
+  if [[ "$CRICTL_DOWNLOAD" != 1 ]]; then
+    warn "  已按 --no-crictl-download 跳过自动安装。手工修复："
+    warn "    curl -L -o /tmp/crictl.tgz https://github.com/kubernetes-sigs/cri-tools/releases/download/${want}/crictl-${want}-linux-amd64.tar.gz"
+    warn "    tar -xzf /tmp/crictl.tgz -C /usr/local/bin && rm -f /tmp/crictl.tgz"
+    return 0
+  fi
+  # 已经装过一次兼容版本就不再重复下载
+  if [[ -x /usr/local/bin/crictl ]]; then
+    local have
+    have="$(/usr/local/bin/crictl --version 2>/dev/null | awk '{print $NF}')"
+    have="${have#v}"
+    if [[ "$(printf '%s' "$have" | cut -d. -f2)" =~ ^[0-9]+$ ]] && \
+       (( $(printf '%s' "$have" | cut -d. -f2) < 25 )); then
+      ok "/usr/local/bin/crictl 已是兼容版本 $have（当前 PATH 中的可能不是它，检查 PATH 顺序）"
+      return 0
+    fi
+  fi
+
+  local url="https://github.com/kubernetes-sigs/cri-tools/releases/download/${want}/crictl-${want}-linux-amd64.tar.gz"
+  local tmpd; tmpd="$(mktemp -d)" || { warn "mktemp 失败，跳过 crictl 安装"; return 0; }
+  info "下载兼容版 crictl ${want}（当前版本次版本号 $cur_minor 过新）"
+  debug "URL: $url"
+  if ! command -v curl >/dev/null 2>&1; then
+    warn "  缺少 curl，无法自动下载。请手工执行上面的命令"
+    rm -rf "$tmpd"; return 0
+  fi
+  if ! curl -fsSL --connect-timeout 15 --max-time 180 -o "$tmpd/crictl.tgz" "$url"; then
+    warn "  下载失败（GitHub 不可达？）。可用 docker ps 代替，或手工按上面命令安装"
+    rm -rf "$tmpd"; return 0
+  fi
+  if tar -xzf "$tmpd/crictl.tgz" -C "$tmpd" 2>/dev/null && [[ -f "$tmpd/crictl" ]]; then
+    if install -m 0755 "$tmpd/crictl" /usr/local/bin/crictl 2>/dev/null; then
+      local got; got="$(/usr/local/bin/crictl --version 2>/dev/null | awk '{print $NF}')"
+      ok "已安装兼容版 crictl： /usr/local/bin/crictl（${got:-$want}）"
+      info "若 crictl 仍报错，说明 PATH 里 /usr/bin 优先： hash -r && type -a crictl"
+    else
+      warn "  安装到 /usr/local/bin/crictl 失败（权限？）"
+    fi
+  else
+    warn "  解压失败，包可能损坏"
+  fi
+  rm -rf "$tmpd"
 }
 
 # ----------------------------- 4. master 初始化 -------------------------------
@@ -776,7 +883,7 @@ install_self_completion() {
     printf '    local options="%s"\n' "$opts"
     printf '    # 需要带值的选项：其取值位置交给默认（文件）补全\n'
     printf '    local valueopts="--k8s-version --service-cidr --pod-cidr --apiserver-ip --image-repository"\n'
-    printf '    valueopts="$valueopts --cri-socket --node-name --ssh-user --inventory --manifest --log-file --token-ttl --drain-node --backup-dir --backup-keep"\n'
+    printf '    valueopts="$valueopts --cri-socket --node-name --ssh-user --inventory --manifest --log-file --token-ttl --drain-node --backup-dir --backup-keep --ingress-manifest"\n'
     printf '    COMPREPLY=()\n'
     printf '    cur="${COMP_WORDS[cword]}"\n'
     printf '    prev="${COMP_WORDS[cword-1]:-}"\n'
@@ -1127,6 +1234,740 @@ apply_cni() {
   wait_for "全部节点 Ready" "$WAIT_TIMEOUT" \
     bash -c "! kubectl get nodes --no-headers 2>/dev/null | grep -q 'NotReady'"
   kubectl get nodes -o wide >&2 || true
+}
+
+# ----------------------------- 6.1b ingress-nginx 清单落盘 ---------------------
+# 清单正文与交付的 kube-ingress.yaml 逐字节一致（含阿里云镜像、NodePort Service），
+# 不做任何改写；需要换镜像/端口请改源文件后重新生成脚本。
+write_ingress_manifest() {
+  info "生成 ingress 清单： $INGRESS_MANIFEST"
+  [[ -f "$INGRESS_MANIFEST" ]] && backup_path "$INGRESS_MANIFEST"
+  write_file "$INGRESS_MANIFEST" <<'EOF'
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ingress-nginx
+  labels:
+    app.kubernetes.io/name: ingress-nginx
+    app.kubernetes.io/instance: ingress-nginx
+
+---
+# Source: ingress-nginx/templates/controller-serviceaccount.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  labels:
+    helm.sh/chart: ingress-nginx-4.0.1
+    app.kubernetes.io/name: ingress-nginx
+    app.kubernetes.io/instance: ingress-nginx
+    app.kubernetes.io/version: 1.0.0
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: controller
+  name: ingress-nginx
+  namespace: ingress-nginx
+automountServiceAccountToken: true
+---
+# Source: ingress-nginx/templates/controller-configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  labels:
+    helm.sh/chart: ingress-nginx-4.0.1
+    app.kubernetes.io/name: ingress-nginx
+    app.kubernetes.io/instance: ingress-nginx
+    app.kubernetes.io/version: 1.0.0
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: controller
+  name: ingress-nginx-controller
+  namespace: ingress-nginx
+data:
+---
+# Source: ingress-nginx/templates/clusterrole.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    helm.sh/chart: ingress-nginx-4.0.1
+    app.kubernetes.io/name: ingress-nginx
+    app.kubernetes.io/instance: ingress-nginx
+    app.kubernetes.io/version: 1.0.0
+    app.kubernetes.io/managed-by: Helm
+  name: ingress-nginx
+rules:
+  - apiGroups:
+      - ''
+    resources:
+      - configmaps
+      - endpoints
+      - nodes
+      - pods
+      - secrets
+    verbs:
+      - list
+      - watch
+  - apiGroups:
+      - ''
+    resources:
+      - nodes
+    verbs:
+      - get
+  - apiGroups:
+      - ''
+    resources:
+      - services
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - networking.k8s.io
+    resources:
+      - ingresses
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - ''
+    resources:
+      - events
+    verbs:
+      - create
+      - patch
+  - apiGroups:
+      - networking.k8s.io
+    resources:
+      - ingresses/status
+    verbs:
+      - update
+  - apiGroups:
+      - networking.k8s.io
+    resources:
+      - ingressclasses
+    verbs:
+      - get
+      - list
+      - watch
+---
+# Source: ingress-nginx/templates/clusterrolebinding.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  labels:
+    helm.sh/chart: ingress-nginx-4.0.1
+    app.kubernetes.io/name: ingress-nginx
+    app.kubernetes.io/instance: ingress-nginx
+    app.kubernetes.io/version: 1.0.0
+    app.kubernetes.io/managed-by: Helm
+  name: ingress-nginx
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ingress-nginx
+subjects:
+  - kind: ServiceAccount
+    name: ingress-nginx
+    namespace: ingress-nginx
+---
+# Source: ingress-nginx/templates/controller-role.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  labels:
+    helm.sh/chart: ingress-nginx-4.0.1
+    app.kubernetes.io/name: ingress-nginx
+    app.kubernetes.io/instance: ingress-nginx
+    app.kubernetes.io/version: 1.0.0
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: controller
+  name: ingress-nginx
+  namespace: ingress-nginx
+rules:
+  - apiGroups:
+      - ''
+    resources:
+      - namespaces
+    verbs:
+      - get
+  - apiGroups:
+      - ''
+    resources:
+      - configmaps
+      - pods
+      - secrets
+      - endpoints
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - ''
+    resources:
+      - services
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - networking.k8s.io
+    resources:
+      - ingresses
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - networking.k8s.io
+    resources:
+      - ingresses/status
+    verbs:
+      - update
+  - apiGroups:
+      - networking.k8s.io
+    resources:
+      - ingressclasses
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - ''
+    resources:
+      - configmaps
+    resourceNames:
+      - ingress-controller-leader
+    verbs:
+      - get
+      - update
+  - apiGroups:
+      - ''
+    resources:
+      - configmaps
+    verbs:
+      - create
+  - apiGroups:
+      - ''
+    resources:
+      - events
+    verbs:
+      - create
+      - patch
+---
+# Source: ingress-nginx/templates/controller-rolebinding.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  labels:
+    helm.sh/chart: ingress-nginx-4.0.1
+    app.kubernetes.io/name: ingress-nginx
+    app.kubernetes.io/instance: ingress-nginx
+    app.kubernetes.io/version: 1.0.0
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: controller
+  name: ingress-nginx
+  namespace: ingress-nginx
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ingress-nginx
+subjects:
+  - kind: ServiceAccount
+    name: ingress-nginx
+    namespace: ingress-nginx
+---
+# Source: ingress-nginx/templates/controller-service-webhook.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    helm.sh/chart: ingress-nginx-4.0.1
+    app.kubernetes.io/name: ingress-nginx
+    app.kubernetes.io/instance: ingress-nginx
+    app.kubernetes.io/version: 1.0.0
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: controller
+  name: ingress-nginx-controller-admission
+  namespace: ingress-nginx
+spec:
+  type: ClusterIP
+  ports:
+    - name: https-webhook
+      port: 443
+      targetPort: webhook
+      appProtocol: https
+  selector:
+    app.kubernetes.io/name: ingress-nginx
+    app.kubernetes.io/instance: ingress-nginx
+    app.kubernetes.io/component: controller
+---
+# Source: ingress-nginx/templates/controller-service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  annotations:
+  labels:
+    helm.sh/chart: ingress-nginx-4.0.1
+    app.kubernetes.io/name: ingress-nginx
+    app.kubernetes.io/instance: ingress-nginx
+    app.kubernetes.io/version: 1.0.0
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: controller
+  name: ingress-nginx-controller
+  namespace: ingress-nginx
+spec:
+  type: NodePort
+  ports:
+    - name: http
+      port: 80
+      protocol: TCP
+      targetPort: http
+      appProtocol: http
+    - name: https
+      port: 443
+      protocol: TCP
+      targetPort: https
+      appProtocol: https
+  selector:
+    app.kubernetes.io/name: ingress-nginx
+    app.kubernetes.io/instance: ingress-nginx
+    app.kubernetes.io/component: controller
+---
+# Source: ingress-nginx/templates/controller-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    helm.sh/chart: ingress-nginx-4.0.1
+    app.kubernetes.io/name: ingress-nginx
+    app.kubernetes.io/instance: ingress-nginx
+    app.kubernetes.io/version: 1.0.0
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: controller
+  name: ingress-nginx-controller
+  namespace: ingress-nginx
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ingress-nginx
+      app.kubernetes.io/instance: ingress-nginx
+      app.kubernetes.io/component: controller
+  revisionHistoryLimit: 10
+  minReadySeconds: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ingress-nginx
+        app.kubernetes.io/instance: ingress-nginx
+        app.kubernetes.io/component: controller
+    spec:
+      dnsPolicy: ClusterFirst
+      containers:
+        - name: controller
+          #image: k8s.gcr.io/ingress-nginx/controller:v1.0.0@sha256:0851b34f69f69352bf168e6ccf30e1e20714a264ab1ecd1933e4d8c0fc3215c6
+          image: registry.cn-beijing.aliyuncs.com/jack_web_images/ops:controller-v1.0.0
+          imagePullPolicy: IfNotPresent
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /wait-shutdown
+          args:
+            - /nginx-ingress-controller
+            - --election-id=ingress-controller-leader
+            - --controller-class=k8s.io/ingress-nginx
+            - --configmap=$(POD_NAMESPACE)/ingress-nginx-controller
+            - --validating-webhook=:8443
+            - --validating-webhook-certificate=/usr/local/certificates/cert
+            - --validating-webhook-key=/usr/local/certificates/key
+          securityContext:
+            capabilities:
+              drop:
+                - ALL
+              add:
+                - NET_BIND_SERVICE
+            runAsUser: 101
+            allowPrivilegeEscalation: true
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: LD_PRELOAD
+              value: /usr/local/lib/libmimalloc.so
+          livenessProbe:
+            failureThreshold: 5
+            httpGet:
+              path: /healthz
+              port: 10254
+              scheme: HTTP
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            successThreshold: 1
+            timeoutSeconds: 1
+          readinessProbe:
+            failureThreshold: 3
+            httpGet:
+              path: /healthz
+              port: 10254
+              scheme: HTTP
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            successThreshold: 1
+            timeoutSeconds: 1
+          ports:
+            - name: http
+              containerPort: 80
+              protocol: TCP
+            - name: https
+              containerPort: 443
+              protocol: TCP
+            - name: webhook
+              containerPort: 8443
+              protocol: TCP
+          volumeMounts:
+            - name: webhook-cert
+              mountPath: /usr/local/certificates/
+              readOnly: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 90Mi
+      nodeSelector:
+        kubernetes.io/os: linux
+      serviceAccountName: ingress-nginx
+      terminationGracePeriodSeconds: 300
+      volumes:
+        - name: webhook-cert
+          secret:
+            secretName: ingress-nginx-admission
+---
+# Source: ingress-nginx/templates/controller-ingressclass.yaml
+# We don't support namespaced ingressClass yet
+# So a ClusterRole and a ClusterRoleBinding is required
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  labels:
+    helm.sh/chart: ingress-nginx-4.0.1
+    app.kubernetes.io/name: ingress-nginx
+    app.kubernetes.io/instance: ingress-nginx
+    app.kubernetes.io/version: 1.0.0
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: controller
+  name: nginx
+  namespace: ingress-nginx
+spec:
+  controller: k8s.io/ingress-nginx
+---
+# Source: ingress-nginx/templates/admission-webhooks/validating-webhook.yaml
+# before changing this value, check the required kubernetes version
+# https://kubernetes.io/docs/reference/access-authn-authz/extensible-admission-controllers/#prerequisites
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  labels:
+    helm.sh/chart: ingress-nginx-4.0.1
+    app.kubernetes.io/name: ingress-nginx
+    app.kubernetes.io/instance: ingress-nginx
+    app.kubernetes.io/version: 1.0.0
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: admission-webhook
+  name: ingress-nginx-admission
+webhooks:
+  - name: validate.nginx.ingress.kubernetes.io
+    matchPolicy: Equivalent
+    rules:
+      - apiGroups:
+          - networking.k8s.io
+        apiVersions:
+          - v1
+        operations:
+          - CREATE
+          - UPDATE
+        resources:
+          - ingresses
+    failurePolicy: Fail
+    sideEffects: None
+    admissionReviewVersions:
+      - v1
+    clientConfig:
+      service:
+        namespace: ingress-nginx
+        name: ingress-nginx-controller-admission
+        path: /networking/v1/ingresses
+---
+# Source: ingress-nginx/templates/admission-webhooks/job-patch/serviceaccount.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ingress-nginx-admission
+  namespace: ingress-nginx
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade,post-install,post-upgrade
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+  labels:
+    helm.sh/chart: ingress-nginx-4.0.1
+    app.kubernetes.io/name: ingress-nginx
+    app.kubernetes.io/instance: ingress-nginx
+    app.kubernetes.io/version: 1.0.0
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: admission-webhook
+---
+# Source: ingress-nginx/templates/admission-webhooks/job-patch/clusterrole.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ingress-nginx-admission
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade,post-install,post-upgrade
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+  labels:
+    helm.sh/chart: ingress-nginx-4.0.1
+    app.kubernetes.io/name: ingress-nginx
+    app.kubernetes.io/instance: ingress-nginx
+    app.kubernetes.io/version: 1.0.0
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: admission-webhook
+rules:
+  - apiGroups:
+      - admissionregistration.k8s.io
+    resources:
+      - validatingwebhookconfigurations
+    verbs:
+      - get
+      - update
+---
+# Source: ingress-nginx/templates/admission-webhooks/job-patch/clusterrolebinding.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ingress-nginx-admission
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade,post-install,post-upgrade
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+  labels:
+    helm.sh/chart: ingress-nginx-4.0.1
+    app.kubernetes.io/name: ingress-nginx
+    app.kubernetes.io/instance: ingress-nginx
+    app.kubernetes.io/version: 1.0.0
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: admission-webhook
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ingress-nginx-admission
+subjects:
+  - kind: ServiceAccount
+    name: ingress-nginx-admission
+    namespace: ingress-nginx
+---
+# Source: ingress-nginx/templates/admission-webhooks/job-patch/role.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ingress-nginx-admission
+  namespace: ingress-nginx
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade,post-install,post-upgrade
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+  labels:
+    helm.sh/chart: ingress-nginx-4.0.1
+    app.kubernetes.io/name: ingress-nginx
+    app.kubernetes.io/instance: ingress-nginx
+    app.kubernetes.io/version: 1.0.0
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: admission-webhook
+rules:
+  - apiGroups:
+      - ''
+    resources:
+      - secrets
+    verbs:
+      - get
+      - create
+---
+# Source: ingress-nginx/templates/admission-webhooks/job-patch/rolebinding.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ingress-nginx-admission
+  namespace: ingress-nginx
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade,post-install,post-upgrade
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+  labels:
+    helm.sh/chart: ingress-nginx-4.0.1
+    app.kubernetes.io/name: ingress-nginx
+    app.kubernetes.io/instance: ingress-nginx
+    app.kubernetes.io/version: 1.0.0
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: admission-webhook
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ingress-nginx-admission
+subjects:
+  - kind: ServiceAccount
+    name: ingress-nginx-admission
+    namespace: ingress-nginx
+---
+# Source: ingress-nginx/templates/admission-webhooks/job-patch/job-createSecret.yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ingress-nginx-admission-create
+  namespace: ingress-nginx
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+  labels:
+    helm.sh/chart: ingress-nginx-4.0.1
+    app.kubernetes.io/name: ingress-nginx
+    app.kubernetes.io/instance: ingress-nginx
+    app.kubernetes.io/version: 1.0.0
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: admission-webhook
+spec:
+  template:
+    metadata:
+      name: ingress-nginx-admission-create
+      labels:
+        helm.sh/chart: ingress-nginx-4.0.1
+        app.kubernetes.io/name: ingress-nginx
+        app.kubernetes.io/instance: ingress-nginx
+        app.kubernetes.io/version: 1.0.0
+        app.kubernetes.io/managed-by: Helm
+        app.kubernetes.io/component: admission-webhook
+    spec:
+      containers:
+        - name: create
+          #image: k8s.gcr.io/ingress-nginx/kube-webhook-certgen:v1.0@sha256:f3b6b39a6062328c095337b4cadcefd1612348fdd5190b1dcbcb9b9e90bd8068
+          image: registry.cn-beijing.aliyuncs.com/jack_web_images/ops:kube-webhook-certgen-v1.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - create
+            - --host=ingress-nginx-controller-admission,ingress-nginx-controller-admission.$(POD_NAMESPACE).svc
+            - --namespace=$(POD_NAMESPACE)
+            - --secret-name=ingress-nginx-admission
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+      restartPolicy: OnFailure
+      serviceAccountName: ingress-nginx-admission
+      nodeSelector:
+        kubernetes.io/os: linux
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 2000
+---
+# Source: ingress-nginx/templates/admission-webhooks/job-patch/job-patchWebhook.yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ingress-nginx-admission-patch
+  namespace: ingress-nginx
+  annotations:
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+  labels:
+    helm.sh/chart: ingress-nginx-4.0.1
+    app.kubernetes.io/name: ingress-nginx
+    app.kubernetes.io/instance: ingress-nginx
+    app.kubernetes.io/version: 1.0.0
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: admission-webhook
+spec:
+  template:
+    metadata:
+      name: ingress-nginx-admission-patch
+      labels:
+        helm.sh/chart: ingress-nginx-4.0.1
+        app.kubernetes.io/name: ingress-nginx
+        app.kubernetes.io/instance: ingress-nginx
+        app.kubernetes.io/version: 1.0.0
+        app.kubernetes.io/managed-by: Helm
+        app.kubernetes.io/component: admission-webhook
+    spec:
+      containers:
+        - name: patch
+          #image: k8s.gcr.io/ingress-nginx/kube-webhook-certgen:v1.0@sha256:f3b6b39a6062328c095337b4cadcefd1612348fdd5190b1dcbcb9b9e90bd8068
+          image: registry.cn-beijing.aliyuncs.com/jack_web_images/ops:kube-webhook-certgen-v1.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - patch
+            - --webhook-name=ingress-nginx-admission
+            - --namespace=$(POD_NAMESPACE)
+            - --patch-mutating=false
+            - --secret-name=ingress-nginx-admission
+            - --patch-failure-policy=Fail
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+      restartPolicy: OnFailure
+      serviceAccountName: ingress-nginx-admission
+      nodeSelector:
+        kubernetes.io/os: linux
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 2000
+EOF
+  ok "ingress 清单已写入： $INGRESS_MANIFEST"
+}
+
+# 判断是否还有可调度的 worker（控制面默认带 NoSchedule taint，单 master 时
+# ingress controller 会一直 Pending，这是很多新手卡住的地方）。
+has_schedulable_node() {
+  local taints
+  taints="$(kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"="}{.spec.taints[*].key}{"\n"}{end}' 2>/dev/null)" || return 1
+  # 没有 taint 的节点，或 taint 里不含 master/control-plane，即视为可调度
+  printf '%s\n' "$taints" | grep -vE '=(.*)(master|control-plane)' | grep -qv '^$'
+}
+
+apply_ingress() {
+  need_root
+  [[ -f "$INGRESS_MANIFEST" ]] || write_ingress_manifest
+  grep -q $'\r' "$INGRESS_MANIFEST" 2>/dev/null && warn "清单含 CRLF，kubectl 可能解析失败（先 dos2unix）"
+
+  if [[ "$DRY_RUN" == 1 ]]; then
+    dry "kubectl apply -f $INGRESS_MANIFEST"
+    dry "等待 ingress-nginx controller 与 admission Job 就绪"
+    return 0
+  fi
+  setup_kubeconfig
+
+  info "kubectl apply -f $INGRESS_MANIFEST"
+  kubectl apply -f "$INGRESS_MANIFEST" || die "ingress 下发失败（详见 $LOG_FILE）"
+
+  # 没有可调度节点时只应用、不空等：等 worker 加入后 Deployment 会自动落位
+  if ! has_schedulable_node; then
+    warn "当前没有可调度节点（控制面带 NoSchedule taint），ingress controller 会保持 Pending"
+    warn "  单机学习环境可去掉 taint： kubectl taint nodes --all node-role.kubernetes.io/master-"
+    warn "  或先加 worker： $(self_invocation) scale（加完会自动调度，无需重跑本命令）"
+    kubectl -n ingress-nginx get pods -o wide >&2 || true
+    return 0
+  fi
+
+  # controller 起来之前 admission webhook（failurePolicy=Fail）会挡住任何 Ingress 创建
+  wait_for "ingress-nginx controller 就绪" "$WAIT_TIMEOUT" \
+    bash -c "kubectl -n ingress-nginx get deployment ingress-nginx-controller -o jsonpath='{.status.readyReplicas}' 2>/dev/null | grep -q '^[1-9]'"
+  wait_for "admission 证书任务完成" 180 \
+    bash -c "kubectl -n ingress-nginx get job ingress-nginx-admission-create -o jsonpath='{.status.succeeded}' 2>/dev/null | grep -q '^1'"
+  kubectl -n ingress-nginx get pods -o wide >&2 || true
+
+  local np
+  np="$(kubectl -n ingress-nginx get svc ingress-nginx-controller \
+        -o jsonpath='{.spec.ports[?(@.name=="http")].nodePort}' 2>/dev/null)"
+  [[ -n "$np" ]] && ok "ingress 入口： http://<节点IP>:${np}"
+  ok "ingress-nginx 就绪；IngressClass 已注册（kubectl get ingressclass）"
 }
 
 # ----------------------------- 6. worker 扩容（ansible）-----------------------
@@ -1880,6 +2721,17 @@ status() {
   fi
   info "控制面与 CNI Pod"
   kubectl get pods -A -o wide 2>/dev/null | awk 'NR==1 || $1 ~ /^kube-/' || true
+  if kubectl get ns ingress-nginx >/dev/null 2>&1; then
+    info "ingress-nginx"
+    kubectl -n ingress-nginx get pods -o wide 2>/dev/null || true
+    local ingress_np
+    ingress_np="$(kubectl -n ingress-nginx get svc ingress-nginx-controller \
+                  -o jsonpath='{.spec.ports[?(@.name=="http")].nodePort}' 2>/dev/null)"
+    kubectl get ingressclass 2>/dev/null >&2 || true
+    if [[ -n "$ingress_np" ]]; then
+      info "  └ 入口： http://<节点IP>:${ingress_np}（NodePort）"
+    fi
+  fi
   info "kube-proxy 模式"
   kubectl -n kube-system get cm kube-proxy -o yaml 2>/dev/null | grep -oE 'mode: *"?ipvs"?' | head -n1 \
     || warn "未检测到 ipvs"
@@ -1929,6 +2781,8 @@ parse_args() {
       --ssh-pass)         SSH_PASSWORD="${2:?--ssh-pass 需要值}"; shift 2 ;;
       --ssh-key)          SSH_KEY_FILE="${2:?--ssh-key 需要值}"; shift 2 ;;
       --keep-backups)     KEEP_BACKUPS=1; shift ;;
+      --no-crictl-download) CRICTL_DOWNLOAD=0; shift ;;
+      --crictl-version)   CRICTL_VERSION_COMPAT="${2:?--crictl-version 需要值}"; shift 2 ;;
       --on)               PORTS_MODE=on; shift ;;
       --off)              PORTS_MODE=off; shift ;;
       --log-keep)         LOG_KEEP="${2:?--log-keep 需要值}"; shift 2 ;;
@@ -1941,6 +2795,7 @@ parse_args() {
       --no-sync-hosts)    SYNC_ANSIBLE_HOSTS=0; shift ;;
       --inventory)        WORKER_INVENTORY="${2:?--inventory 需要值}"; shift 2 ;;
       --manifest)         FLANNEL_MANIFEST="${2:?--manifest 需要值}"; shift 2 ;;
+      --ingress-manifest) INGRESS_MANIFEST="${2:?--ingress-manifest 需要值}"; shift 2 ;;
       -l|--log-file)      LOG_FILE="${2:?$1 需要值}"; shift 2 ;;
       --force)            FORCE=1; shift ;;
       --insecure-ports)   ALLOW_INSECURE_PORTS=1; shift ;;
@@ -2033,6 +2888,7 @@ main() {
     token)         need_root; token_cmd ;;
     completion)    need_root; install_shell_completion ;;
     cni)           need_root; apply_cni ;;
+    ingress)       need_root; apply_ingress ;;
     scale)         need_root; scale_workers ;;
     ports)         ports_cmd ;;
     drain)         need_root; drain_workers ;;
@@ -2054,6 +2910,8 @@ main() {
       else
         warn "已跳过 worker 扩容，稍后可执行： $(self_invocation) scale"
       fi
+      # ingress 放在 worker 之后：控制面默认带 NoSchedule taint，先加 worker 才能调度
+      apply_ingress
       status
       ;;
     *) usage; exit 2 ;;

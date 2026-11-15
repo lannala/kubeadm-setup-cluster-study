@@ -79,7 +79,7 @@ kubesetup status                           # 照常工作
 |---|---|---|
 | `kubectl` | 子命令、资源、flag | `/etc/profile.d/k8s-completion.sh` |
 | `kubeadm` | 子命令、flag | 同上 |
-| `kubesetup` | 17 个子命令 + 全部长选项 | `/etc/bash_completion.d/kubesetup` |
+| `kubesetup` | 18 个子命令 + 全部长选项 | `/etc/bash_completion.d/kubesetup` |
 
 `kubesetup` 的补全清单**与参数白名单同源**（都来自脚本里的 `SUBCOMMANDS` / `CMD_OPTIONS` 数组），不会出现"能补全但跑不通"的漂移。补全用纯 bash 写的，不依赖 `bash-completion` 框架；`kubectl`/`kubeadm` 那套则要求系统装了 `bash-completion`。
 
@@ -96,17 +96,18 @@ complete -p kubesetup        # 有输出说明注册成功
 
 ## 子命令详解
 
-共 17 个，全部纯字母无连字符。**除 `preflight`、`status`、`certs` 可用普通用户执行外，其余均需 root**。
+共 18 个，全部纯字母无连字符。**除 `preflight`、`status`、`certs` 可用普通用户执行外，其余均需 root**。
 
 | 子命令 | 作用 | 改动系统 | 需 root |
 |---|---|---|---|
 | `bootstrap` | **缺省**。全流程：准备 → init → CNI → 询问是否加 worker → 显示状态 | ✅ | ✅ |
 | `preflight` | 只读体检，逐项输出 `[ok]`/`[warn]`；未通过时退出码 1（便于 CI） | ❌ | 建议 |
-| `prepare` | 单节点全套准备（yum repo、时间、防火墙、SELinux、swap、sysctl、IPVS、Docker、kubelet、补全） | ✅ | ✅ |
+| `prepare` | 单节点全套准备（yum repo、时间、防火墙、SELinux、swap、sysctl、IPVS、Docker、kubelet、crictl、补全） | ✅ | ✅ |
 | `init` | 生成 kubeadm 配置并执行 `kubeadm init`，配好 kubeconfig，产出 join 命令 | ✅ | ✅ |
 | `token` | 只生成/重造 join 命令（默认永不过期） | ⚠️ 写 token | ✅ |
 | `completion` | 只安装 kubectl / kubeadm / kubesetup 补全 | ⚠️ 写 profile.d | ✅ |
 | `cni` | 落盘 Flannel 清单并 `kubectl apply`，等待 flannel Pod 与节点 Ready | ✅ | ✅ |
+| `ingress` | 落盘 ingress-nginx 清单并 `kubectl apply`（NodePort），等待 controller/admission 就绪 | ✅ | ✅ |
 | `scale` | 交互输入 worker 数量与 IP，经 ansible 批量准备 + join | ✅ 含远端 | ✅ |
 | `drain` | **缩容**：drain 驱逐 Pod → 摘除节点 → 清理清单（`--drain-node` 指定单台） | 🔴 摘除节点 | ✅ |
 | `ports` | 控制面 insecure 端口（10251/10252）开关：查看 / `--on` / `--off` | ✅ 改 manifest | ✅ |
@@ -132,11 +133,60 @@ complete -p kubesetup        # 有输出说明注册成功
 8. **Docker** — 加 docker-ce 源、写 `/etc/docker/daemon.json`（`data-root=DOCKER_DATA_ROOT`、`exec-opts=native.cgroupdriver=systemd`）、启动并**校验 cgroup 驱动确实是 systemd**
 9. **kubelet 三件套** — 锁定 `kubelet/kubeadm/kubectl-1.20.11`，写 `/etc/sysconfig/kubelet`（只留 `--node-ip`），然后 **`systemctl enable kubelet`（只 enable，不 start）** + `systemctl reset-failed kubelet`
    —— init 前 kubelet 缺 `/var/lib/kubelet/config.yaml`，启动必失败；若此时反复拉起会打满 systemd 的启动频率限制，导致 kubeadm 后在 `kubelet-start` 阶段真正启动它时被拒绝。启动交给 kubeadm。
-10. **补全** — 见[命令补全](#命令补全)
+10. **crictl** — 写 `/etc/crictl.yaml` 固定 endpoint，并检查 crictl 版本是否与 dockershim 兼容（见下）
+11. **补全** — 见[命令补全](#命令补全)
 
 > 默认**不会**执行 `systemctl restart network`：sysctl 变更并不需要它，而远程操作时这一步常把自己踢下线。确实需要时加 `--restart-network`。
 
 **cgroup 驱动单一来源**：只由 kubeadm 的 `KubeletConfiguration.cgroupDriver` 下发（写进 `/var/lib/kubelet/config.yaml`，worker 通过 `kubelet-config` ConfigMap 继承）。早期版本还在 `/etc/sysconfig/kubelet` 和 `kubeletExtraArgs` 里各传一份 `--cgroup-driver`，属于重复下发，已移除。
+
+### crictl 配置（版本兼容是坑）
+
+`prepare` 会写 `/etc/crictl.yaml`：
+
+```yaml
+runtime-endpoint: unix:///var/run/dockershim.sock
+image-endpoint: unix:///var/run/dockershim.sock
+timeout: 10
+debug: false
+```
+
+不写这个文件时，`crictl` 会依次尝试 4 个 socket（dockershim / containerd / crio / cri-dockerd），全部失败后吐一屏 `WARN`，很容易误判成集群坏了。
+
+**更隐蔽的问题在版本**：kubelet 1.20 的 dockershim 只实现 **CRI v1alpha2**，而 `crictl` v1.25+ 只讲 **v1**，于是出现：
+
+```
+Validating service connection for "unix:///var/run/dockershim.sock":
+  CRI v1 runtime API is not implemented ... unknown service runtime.v1.RuntimeService
+FATA[0000] getting status of runtime: ... connect: no such file or directory
+```
+
+注意第一行说明**socket 其实是通的**，只是 API 版本对不上：
+
+| crictl 版本 | 结果 |
+|---|---|
+| ≤ v1.24 | 与 dockershim 兼容，`crictl ps` 正常 |
+| ≥ v1.25 | 报 `CRI v1 runtime API is not implemented`，需降级 |
+
+脚本检测到不兼容时会**自动装一份兼容版到 `/usr/local/bin/crictl`**（默认 `v1.22.0`，覆盖 PATH 里那个过新的；原文件不动，可回退）：
+
+```bash
+sudo kubesetup prepare                        # 自动下载并安装 v1.22.0
+sudo kubesetup prepare --no-crictl-download   # 只提示，不自动装
+sudo kubesetup prepare --crictl-version v1.22.0
+hash -r && type -a crictl                     # 确认用的是 /usr/local/bin 那个
+```
+
+装好后 `crictl ps` 就正常了。手工等价操作：
+
+```bash
+curl -L -o /tmp/crictl.tgz \
+  https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.22.0/crictl-v1.22.0-linux-amd64.tar.gz
+tar -xzf /tmp/crictl.tgz -C /usr/local/bin && rm -f /tmp/crictl.tgz
+crictl --version && crictl ps
+```
+
+> 本集群运行时是 Docker，日常也可以用 `docker ps` / `docker logs` / `docker exec` 代替 crictl。
 
 ### 首次 init 前 kubelet 为什么反复失败（含 CRI 报错）
 
@@ -181,11 +231,46 @@ F1108 15:48:20 server.go:198] failed to load Kubelet config file /var/lib/kubele
 3. **写清单** —— `/root/k8s-workers.ini`（脚本自己用），并**幂等同步**到 `/etc/ansible/hosts` 的受管块（手工 `ansible workers -m ping` 不用带 `-i`）
 4. **ping** —— 失败时打印完整输出与排查命令
 5. **分发脚本** —— 把本脚本拷到各 worker 的 `/usr/bin/kubesetup`
-6. **prepare** —— 远端执行 `kubesetup prepare`
+6. **prepare** —— 远端执行 `kubesetup prepare`（含 crictl 配置）
 7. **join** —— 逐台执行缓存的 join 命令，统计失败
 8. **等待** —— 全部节点 `Ready`
 
 所有 ansible 调用都带 `StrictHostKeyChecking=no`、`ConnectTimeout=10`、`BatchMode=yes`，**不会弹出 `continue connecting (yes/no)` 把脚本卡住**。
+
+### ingress（ingress-nginx）
+
+清单 `kube-ingress.yaml`（ingress-nginx v1.0.0 / chart 4.0.1，阿里云镜像，Service 类型 **NodePort**）与脚本内联，**正文逐字节原样保留**，`bootstrap` 最后一步会自动下发；也可以单独执行：
+
+```bash
+sudo kubesetup ingress                        # 落盘 + apply + 等就绪
+sudo kubesetup ingress --ingress-manifest /opt/kube-ingress.yaml
+```
+
+做了什么：
+
+1. 把内联清单写到 `~/kube-ingress.yaml`（`--ingress-manifest` 可改路径）；
+2. `kubectl apply -f`；
+3. 等 `ingress-nginx-controller` 的 `readyReplicas ≥ 1`，以及 `ingress-nginx-admission-create` Job 成功
+   —— 顺序很重要：admission webhook 是 `failurePolicy: Fail`，controller 没起来时创建 Ingress 会被拒；
+4. 打印 NodePort 入口，例如 `http://<节点IP>:30080`。
+
+**单 master 的坑**：控制面默认带 `node-role.kubernetes.io/master:NoSchedule` taint，ingress controller 会一直 `Pending`。脚本检测到"没有可调度节点"时会告警并给出两条路（不会干等 10 分钟）：
+
+```bash
+# 方案 A：先加 worker（推荐），加完自动调度
+sudo kubesetup scale
+
+# 方案 B：单机学习环境去掉 taint
+kubectl taint nodes --all node-role.kubernetes.io/master-
+```
+
+验证：
+
+```bash
+kubectl -n ingress-nginx get pods -o wide
+kubectl get ingressclass                     # 应看到 nginx
+kubectl -n ingress-nginx get svc ingress-nginx-controller   # 看 80/443 的 NodePort
+```
 
 ### 节点缩容（drain）
 
@@ -319,6 +404,7 @@ kubesetup init --token-ttl 24h       # 初始化时就限定有效期
 | `--ssh-pass` | `SSH_PASSWORD` | 空 = 用 `ssh-copy-id` 交互输入 |
 | `--ssh-key` | `SSH_KEY_FILE` | `~/.ssh/id_rsa`（不存在会自动生成） |
 | `--manifest` | `FLANNEL_MANIFEST` | `$HOME/kube-flannel-all.yml` |
+| `--ingress-manifest` | `INGRESS_MANIFEST` | `$HOME/kube-ingress.yaml` |
 | `--drain-node` | `DRAIN_NODE` | 空 = 交互输入；仅 `drain` |
 | `--on` / `--off` | `PORTS_MODE` | `status`；仅 `ports` |
 | `--backup-dir` | `ETCD_BACKUP_DIR` | `/root/etcd-backups` |
@@ -326,6 +412,8 @@ kubesetup init --token-ttl 24h       # 初始化时就限定有效期
 | `--keep-backups` | `KEEP_BACKUPS` | `0`（成功即删备份） |
 | — | `BACKUP_ROOT` | `/var/backups/kubesetup` |
 | `--log-keep` | `LOG_KEEP` | `2`（保留最近 N 份日志） |
+| `--crictl-version` | `CRICTL_VERSION_COMPAT` | `v1.22.0`（与 dockershim 兼容的版本） |
+| `--no-crictl-download` | `CRICTL_DOWNLOAD` | `1`（不兼容时自动安装） |
 | — | `JOIN_FILE` | `$HOME/kubeadm-join-command.txt` |
 | — | `REMOTE_SCRIPT` | `/usr/bin/kubesetup` |
 | — | `WORKER_HOST_PREFIX` | `worker` |
@@ -374,10 +462,11 @@ ETCD_BACKUP_KEEP=5
 
 ```bash
 sudo kubesetup preflight      # 1. 看环境差什么
-sudo kubesetup prepare        # 2. 打底：repo / 内核参数 / docker / kubelet
+sudo kubesetup prepare        # 2. 打底：repo / 内核参数 / docker / kubelet / crictl
 sudo kubesetup init           # 3. 起控制面，拿到 join 命令
 sudo kubesetup cni            # 4. 装网络，节点 NotReady → Ready
-sudo kubesetup scale          # 5. 加 worker
+sudo kubesetup scale          # 5. 加 worker（ingress 需要有可调度节点）
+sudo kubesetup ingress        # 6. 装 ingress-nginx（NodePort）
 kubesetup status              # 随时看状态（含 get cs）
 
 kubesetup backup              # 练熟了先做一份 etcd 快照
@@ -431,6 +520,7 @@ kubesetup certs            # 复核
 | `/etc/sysconfig/modules/ipvs.modules` | 新建（0755） |
 | `/etc/docker/daemon.json` | 写入（已存在则先备份） |
 | `/etc/sysconfig/kubelet` | 写入（已存在则先备份），内容只有 `--node-ip` |
+| `/etc/crictl.yaml` | 写入（0644），固定 CRI endpoint |
 | `/etc/kubernetes/kubeadm-init.yaml` | 由 `init` 生成 |
 | `/etc/kubernetes/manifests/kube-{scheduler,controller-manager}.yaml` | 仅 `ports --on/--off` 时改写 `--port=0` |
 | `/etc/profile.d/k8s-completion.sh` | 新建（0644），kubectl/kubeadm 补全 |
@@ -439,6 +529,7 @@ kubesetup certs            # 复核
 | `/etc/ansible/hosts` | 写入一个受管块 `[workers]`（`--no-sync-hosts` 可关） |
 | `~/.bashrc` | 幂等追加 `KUBECONFIG` 与补全 source 行 |
 | `~/kube-flannel-all.yml`、`~/kubeadm-join-command.txt`、`/root/k8s-workers.ini` | 生成，权限 `0600` |
+| `~/kube-ingress.yaml` | 生成，权限 `0600`（ingress-nginx 清单） |
 
 服务：`firewalld` 停用并 disable，`chronyd` 启用，`docker`/`kubelet` 启用开机自启。
 
@@ -473,11 +564,15 @@ kubesetup certs            # 复核
 
 | 现象 | 处理 |
 |---|---|
+| `crictl ps` 报 `CRI v1 runtime API is not implemented` | crictl 版本过新（≥v1.25 只说 v1，dockershim 只支持 v1alpha2）。降到 v1.22，或改用 `docker ps`。见 [crictl 配置](#crictl-配置版本兼容是坑) |
+| `crictl` 吐一屏 `WARN ... default endpoints` | 没有 `/etc/crictl.yaml`。`sudo kubesetup prepare` 会写；或手工 `crictl --runtime-endpoint unix:///var/run/dockershim.sock ps` |
 | `[ERROR CRI]` / `[ERROR ImagePull] ... dial unix .../dockershim.sock` | init **之前**出现属正常（kubelet 缺 `config.yaml`）。init **之后**才要查：`journalctl -u kubelet -b --no-pager -o cat \| head -40`、`systemctl is-active docker`、`docker info \| grep -i cgroup`（应 `systemd`） |
 | kubelet 报 `failed to load Kubelet config file` | init 前正常；init 后仍报说明 `kubelet-start` 没跑成，`kubeadm reset -f` 重试 |
 | `kubeadm init` 失败 | `journalctl -u kubelet -b --no-pager -o cat \| head -40` 看首个 `F`/`E` 行。注意 `journalctl` 默认带前缀，**必须 `-o cat`**，否则 `grep '^F'` 永远匹配不到 |
 | `kubectl get cs` 显示 scheduler/controller-manager `Unhealthy` | **不是故障**。insecure 端口默认关闭。真实健康看 `kubectl get --raw='/readyz?verbose'`；想全绿用 `kubesetup ports --on` |
 | 节点一直 `NotReady` | CNI 未就绪：`kubectl -n kube-flannel get pods`、`kubectl -n kube-flannel logs -f ds/kube-flannel-ds`；确认 `POD_CIDR` 与清单 `Network` 一致 |
+| `ingress-nginx` Pod 一直 `Pending` | 控制面带 NoSchedule taint：先 `kubesetup scale` 加 worker，或单机学习环境 `kubectl taint nodes --all node-role.kubernetes.io/master-` |
+| 创建 Ingress 报 `failed calling webhook` | admission webhook 已注册但 controller 未就绪：`kubectl -n ingress-nginx get pods`，等 controller Running 后重试 |
 | Pod 跨节点不通 | `cat /proc/sys/net/ipv4/ip_forward` 应为 `1`；`lsmod \| grep br_netfilter`、`grep -c . /etc/resolv.conf` |
 | kube-proxy 非 ipvs | `kubesetup status` 会检查；确认用的是 `init` 生成的配置 |
 | `kubesetup` 命令找不到 | 确认 `/usr/bin/kubesetup` 存在且在 `PATH`；`sudo kubesetup install`。旧会话需 `hash -r` |
@@ -512,6 +607,7 @@ kubesetup certs            # 复核
 - **单 master 架构**：不支持多 master/HA，也不支持移除 master（`drain` 会拒绝）。
 - **仅 CentOS/RHEL 7.x**：依赖 `yum`、`firewalld`、`chronyd`、systemd 的写法。
 - **Kubernetes 固定 1.20.11**：镜像 tag、API 版本（`kubeadm.k8s.io/v1beta2`）、`dockershim` 都是按这个版本写的；换版本要同步改这些。
+- **crictl 需 ≤ v1.24**：dockershim 只实现 CRI v1alpha2，新版本 crictl 不可用（脚本会检测并提示）。
 - **网络依赖外网**：yum 源、Docker 源、K8s 镜像源都是阿里云；离线环境需自建源。
 - **两处正文不可改**：`Centos-Base.repo` 与 `kube-flannel-all.yml` 按要求原样保留，`POD_CIDR` 必须等于清单里的 `Network`（`10.244.0.0/16`）。
 - **bash 4.2 兼容**：不使用 `${var@Q}` 等 4.4+ 语法；空数组展开统一用 `${arr[@]+"${arr[@]}"}`。
@@ -526,6 +622,7 @@ kubesetup certs            # 复核
 - 主回归 **56 项**断言 + 补全加载链路 **13 项**断言，全部通过
 - 覆盖场景：子命令中途失败仍完成命令安装、删除源脚本后功能完好、参数白名单/补全清单/帮助文本三者同源、`--dry-run` 零系统副作用、`--token-ttl` 与 `EXPIRES=never` 复核、可选包安装失败不中断流程、补全链路与路径可配置性、init 前 CRI 参数取舍、cgroup 驱动单一来源、帮助文本跟随文件名
 - 新增子命令定向验证：`ports --on/--off` 双向 + 幂等 + 与原始 manifest 逐字节一致、`drain` 拒绝 master、`backup` dry-run 不依赖 etcdctl、`certs` 输出
+- 其他定向验证：`crictl` 版本兼容判定（v1.22 放行 / v1.25 告警并给降级命令）、SSH 免密自动分发（有/无 sshpass 两条路径）、python 逐台探测、`/etc/ansible/hosts` 受管块幂等
 - 清理逻辑验证：成功删备份 / 失败保留 / 日志剪枝 / 无散落 `.bak`
 - 5 项"污染自检"断言：测试过程绝不写入真实 `/usr/bin`、`/etc`
 
