@@ -76,7 +76,7 @@ jiaoben/
 ## 通用约定
 
 1. **目标系统**：CentOS / RHEL 7.x（x86_64），需要 root。部分脚本（kubesetup）对 7.9 验证最充分。
-2. **用法统一**：无参数运行多数脚本会进交互菜单；也支持子命令（`install` / `start` / `stop` / `restart` / `status` 等），详见各目录 README。
+2. **用法统一**：无参数运行多数脚本会进交互菜单；也支持子命令（install / start / stop / restart / status 等），详见各目录 README。
 3. **离线友好**：安装包优先在本机目录查找，顺序大致为
    `/root /data /date /tmp /opt /usr/local /usr/src` + 当前目录；
    找不到才联网下载。可用的覆盖变量：
@@ -89,7 +89,7 @@ jiaoben/
 
 ## kubesetup（重点脚本）
 
-`kubesetup/kubesetup.sh` 是这套脚本里最完整的一个：CentOS 7.9 单 master 部署 Kubernetes 1.20.11，内置 18 个子命令（`bootstrap` / `preflight` / `prepare` / `init` / `cni` / `ingress` / `scale` / `drain` / `certs` / `renew` / `backup` / `status` / `reset` 等），并把 `Centos-Base.repo` 与 Flannel / ingress-nginx 清单内联在脚本里。
+kubesetup/kubesetup.sh 是这套脚本里最完整的一个：CentOS 7.9 单 master 部署 Kubernetes 1.20.11，内置 18 个子命令（bootstrap / preflight / prepare / init / cni / ingress / scale / drain / certs / renew / backup / status / reset 等），并把 `Centos-Base.repo` 与 Flannel / ingress-nginx 清单内联在脚本里。
 
 首次部署：
 
